@@ -2,7 +2,7 @@ package aws_test
 
 import (
 	"fmt"
-	"github.com/crowdmob/goamz/aws"
+	"github.com/paddie/goamz/aws"
 	"launchpad.net/gocheck"
 	"net/http"
 	"strings"
