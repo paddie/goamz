@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 var b64 = base64.StdEncoding
@@ -50,10 +51,19 @@ type Server struct {
 	instances            map[string]*Instance      // id -> instance
 	reservations         map[string]*reservation   // id -> reservation
 	groups               map[string]*securityGroup // id -> group
+	vpcs                 map[string]*vpc           // id -> vpc
+	subnets              map[string]*subnet        // id -> subnet
+	ifaces               map[string]*iface         // id -> iface
+	attachments          map[string]*attachment    // id -> attachment
 	maxId                counter
 	reqId                counter
 	reservationId        counter
 	groupId              counter
+	vpcId                counter
+	dhcpOptsId           counter
+	subnetId             counter
+	ifaceId              counter
+	attachId             counter
 	initialInstanceState ec2.InstanceState
 }
 
@@ -66,14 +76,17 @@ type reservation struct {
 
 // instance holds a simulated ec2 instance
 type Instance struct {
+	seq        int
+	dnsNameSet bool
 	// UserData holds the data that was passed to the RunInstances request
 	// when the instance was started.
 	UserData    []byte
-	id          string
 	imageId     string
 	reservation *reservation
 	instType    string
 	state       ec2.InstanceState
+	subnetId    string
+	vpcId       string
 }
 
 // permKey represents permission for a given security
@@ -97,6 +110,7 @@ type securityGroup struct {
 	id          string
 	name        string
 	description string
+	vpcId       string
 
 	perms map[permKey]bool
 }
@@ -138,6 +152,8 @@ func (g *securityGroup) matchAttr(attr, value string) (ok bool, err error) {
 		return g.hasPerm(func(k permKey) bool { return k.protocol == value }), nil
 	case "owner-id":
 		return value == ownerId, nil
+	case "vpc-id":
+		return g.vpcId == value, nil
 	}
 	return false, fmt.Errorf("unknown attribute %q", attr)
 }
@@ -190,6 +206,81 @@ func (g *securityGroup) ec2Perms() (perms []ec2.IPPerm) {
 	return
 }
 
+type vpc struct {
+	ec2.VPC
+}
+
+func (v *vpc) matchAttr(attr, value string) (ok bool, err error) {
+	switch attr {
+	case "cidr":
+		return v.CIDRBlock == value, nil
+	case "state":
+		return v.State == value, nil
+	case "vpc-id":
+		return v.Id == value, nil
+	case "tag", "tag-key", "tag-value", "dhcp-options-id", "isDefault":
+		return false, fmt.Errorf("%q filter is not implemented", attr)
+	}
+	return false, fmt.Errorf("unknown attribute %q", attr)
+}
+
+type subnet struct {
+	ec2.Subnet
+}
+
+func (s *subnet) matchAttr(attr, value string) (ok bool, err error) {
+	switch attr {
+	case "cidr":
+		return s.CIDRBlock == value, nil
+	case "availability-zone":
+		return s.AvailZone == value, nil
+	case "state":
+		return s.State == value, nil
+	case "subnet-id":
+		return s.Id == value, nil
+	case "vpc-id":
+		return s.VPCId == value, nil
+	case "tag", "tag-key", "tag-value", "available-ip-address-count", "defaultForAz":
+		return false, fmt.Errorf("%q filter not implemented", attr)
+	}
+	return false, fmt.Errorf("unknown attribute %q", attr)
+}
+
+type iface struct {
+	ec2.NetworkInterface
+}
+
+func (i *iface) matchAttr(attr, value string) (ok bool, err error) {
+	notImplemented := []string{
+		"addresses.", "association.", "tag", "requester-",
+		"attachment.", "source-dest-check", "mac-address",
+		"group-", "description", "private-", "owner-id",
+	}
+	switch attr {
+	case "availability-zone":
+		return i.AvailZone == value, nil
+	case "network-interface-id":
+		return i.Id == value, nil
+	case "status":
+		return i.Status == value, nil
+	case "subnet-id":
+		return i.SubnetId == value, nil
+	case "vpc-id":
+		return i.VPCId == value, nil
+	default:
+		for _, item := range notImplemented {
+			if strings.HasPrefix(attr, item) {
+				return false, fmt.Errorf("%q filter not implemented", attr)
+			}
+		}
+	}
+	return false, fmt.Errorf("unknown attribute %q", attr)
+}
+
+type attachment struct {
+	ec2.NetworkInterfaceAttachment
+}
+
 var actions = map[string]func(*Server, http.ResponseWriter, *http.Request, string) interface{}{
 	"RunInstances":                  (*Server).runInstances,
 	"TerminateInstances":            (*Server).terminateInstances,
@@ -199,6 +290,17 @@ var actions = map[string]func(*Server, http.ResponseWriter, *http.Request, strin
 	"DeleteSecurityGroup":           (*Server).deleteSecurityGroup,
 	"AuthorizeSecurityGroupIngress": (*Server).authorizeSecurityGroupIngress,
 	"RevokeSecurityGroupIngress":    (*Server).revokeSecurityGroupIngress,
+	"CreateVpc":                     (*Server).createVpc,
+	"DeleteVpc":                     (*Server).deleteVpc,
+	"DescribeVpcs":                  (*Server).describeVpcs,
+	"CreateSubnet":                  (*Server).createSubnet,
+	"DeleteSubnet":                  (*Server).deleteSubnet,
+	"DescribeSubnets":               (*Server).describeSubnets,
+	"CreateNetworkInterface":        (*Server).createIFace,
+	"DeleteNetworkInterface":        (*Server).deleteIFace,
+	"DescribeNetworkInterfaces":     (*Server).describeIFaces,
+	"AttachNetworkInterface":        (*Server).attachIFace,
+	"DetachNetworkInterface":        (*Server).detachIFace,
 }
 
 const ownerId = "9876"
@@ -219,6 +321,10 @@ func NewServer() (*Server, error) {
 	srv := &Server{
 		instances:            make(map[string]*Instance),
 		groups:               make(map[string]*securityGroup),
+		vpcs:                 make(map[string]*vpc),
+		subnets:              make(map[string]*subnet),
+		ifaces:               make(map[string]*iface),
+		attachments:          make(map[string]*attachment),
 		reservations:         make(map[string]*reservation),
 		initialInstanceState: Pending,
 	}
@@ -422,16 +528,25 @@ func (srv *Server) runInstances(w http.ResponseWriter, req *http.Request, reqId 
 	//    InstanceType              ?
 	//    KernelId                  ?
 	//    RamdiskId                 ?
-	//    AvailabilityZone          ?
+	//    AvailZone                 ?
 	//    GroupName                 tag
 	//    Monitoring                ignore?
-	//    SubnetId                  ?
 	//    DisableAPITermination     bool
 	//    ShutdownBehavior          string
 	//    PrivateIPAddress          string
 
 	srv.mu.Lock()
 	defer srv.mu.Unlock()
+
+	var vpcId string
+	subnetId := req.Form.Get("SubnetId")
+	if subnetId != "" {
+		sub, found := srv.subnets[subnetId]
+		if !found {
+			fatalf(400, "InvalidSubnetID.NotFound", "subnet %s not found", subnetId)
+		}
+		vpcId = sub.VPCId
+	}
 
 	// make sure that form fields are correct before creating the reservation.
 	instType := req.Form.Get("InstanceType")
@@ -445,7 +560,7 @@ func (srv *Server) runInstances(w http.ResponseWriter, req *http.Request, reqId 
 	resp.OwnerId = ownerId
 
 	for i := 0; i < max; i++ {
-		inst := srv.newInstance(r, instType, imageId, srv.initialInstanceState)
+		inst := srv.newInstance(r, instType, imageId, srv.initialInstanceState, subnetId, vpcId)
 		inst.UserData = userData
 		resp.Instances = append(resp.Instances, inst.ec2instance())
 	}
@@ -464,10 +579,15 @@ func (srv *Server) group(group ec2.SecurityGroup) *securityGroup {
 	return nil
 }
 
-// NewInstances creates n new instances in srv with the given instance type,
-// image ID,  initial state and security groups. If any group does not already
-// exist, it will be created. NewInstances returns the ids of the new instances.
-func (srv *Server) NewInstances(n int, instType string, imageId string, state ec2.InstanceState, groups []ec2.SecurityGroup) []string {
+// NewInstancesVPC creates n new VPC instances in srv with the given
+// instance type, image ID, initial state, and security groups,
+// belonging to the given vpcId and subnetId. If any group does not
+// already exist, it will be created. NewInstancesVPC returns the ids
+// of the new instances.
+//
+// If vpcId and subnetId are both empty, this call is equivalent to
+// calling NewInstances.
+func (srv *Server) NewInstancesVPC(vpcId, subnetId string, n int, instType string, imageId string, state ec2.InstanceState, groups []ec2.SecurityGroup) []string {
 	srv.mu.Lock()
 	defer srv.mu.Unlock()
 
@@ -483,22 +603,35 @@ func (srv *Server) NewInstances(n int, instType string, imageId string, state ec
 
 	ids := make([]string, n)
 	for i := 0; i < n; i++ {
-		inst := srv.newInstance(r, instType, imageId, state)
-		ids[i] = inst.id
+		inst := srv.newInstance(r, instType, imageId, state, subnetId, vpcId)
+		ids[i] = inst.id()
 	}
 	return ids
 }
 
-func (srv *Server) newInstance(r *reservation, instType string, imageId string, state ec2.InstanceState) *Instance {
+// NewInstances creates n new instances in srv with the given instance
+// type, image ID, initial state, and security groups. If any group
+// does not already exist, it will be created. NewInstances returns
+// the ids of the new instances.
+func (srv *Server) NewInstances(n int, instType string, imageId string, state ec2.InstanceState, groups []ec2.SecurityGroup) []string {
+	return srv.NewInstancesVPC("", "", n, instType, imageId, state, groups)
+}
+
+func (srv *Server) newInstance(r *reservation, instType string, imageId string, state ec2.InstanceState, subnetId, vpcId string) *Instance {
 	inst := &Instance{
-		id:          fmt.Sprintf("i-%d", srv.maxId.next()),
+		seq:         srv.maxId.next(),
 		instType:    instType,
 		imageId:     imageId,
 		state:       state,
 		reservation: r,
 	}
-	srv.instances[inst.id] = inst
-	r.instances[inst.id] = inst
+	if vpcId != "" && subnetId != "" {
+		inst.vpcId = vpcId
+		inst.subnetId = subnetId
+	}
+	id := inst.id()
+	srv.instances[id] = inst
+	r.instances[id] = inst
 	return inst
 }
 
@@ -535,20 +668,39 @@ func (srv *Server) terminateInstances(w http.ResponseWriter, req *http.Request, 
 	return &resp
 }
 
+func (inst *Instance) id() string {
+	return fmt.Sprintf("i-%d", inst.seq)
+}
+
 func (inst *Instance) terminate() (d ec2.InstanceStateChange) {
 	d.PreviousState = inst.state
 	inst.state = ShuttingDown
 	d.CurrentState = inst.state
-	d.InstanceId = inst.id
+	d.InstanceId = inst.id()
 	return d
 }
 
 func (inst *Instance) ec2instance() ec2.Instance {
+	id := inst.id()
+	// The first time the instance is returned, its DNSName
+	// will be empty. The client should then refresh the instance.
+	var dnsName string
+	if inst.dnsNameSet {
+		dnsName = fmt.Sprintf("%s.testing.invalid", id)
+	} else {
+		inst.dnsNameSet = true
+	}
 	return ec2.Instance{
-		InstanceId:   inst.id,
-		InstanceType: inst.instType,
-		ImageId:      inst.imageId,
-		DNSName:      fmt.Sprintf("%s.example.com", inst.id),
+		InstanceId:       id,
+		InstanceType:     inst.instType,
+		ImageId:          inst.imageId,
+		DNSName:          dnsName,
+		PrivateDNSName:   fmt.Sprintf("%s.internal.invalid", id),
+		IPAddress:        fmt.Sprintf("8.0.0.%d", inst.seq%256),
+		PrivateIPAddress: fmt.Sprintf("127.0.0.%d", inst.seq%256),
+		State:            inst.state,
+		VPCId:            inst.vpcId,
+		SubnetId:         inst.subnetId,
 		// TODO the rest
 	}
 }
@@ -558,15 +710,19 @@ func (inst *Instance) matchAttr(attr, value string) (ok bool, err error) {
 	case "architecture":
 		return value == "i386", nil
 	case "instance-id":
-		return inst.id == value, nil
-	case "group-id":
+		return inst.id() == value, nil
+	case "subnet-id":
+		return inst.subnetId == value, nil
+	case "vpc-id":
+		return inst.vpcId == value, nil
+	case "instance.group-id", "group-id":
 		for _, g := range inst.reservation.groups {
 			if g.id == value {
 				return true, nil
 			}
 		}
 		return false, nil
-	case "group-name":
+	case "instance.group-name", "group-name":
 		for _, g := range inst.reservation.groups {
 			if g.name == value {
 				return true, nil
@@ -611,6 +767,10 @@ func (srv *Server) createSecurityGroup(w http.ResponseWriter, req *http.Request,
 		id:          fmt.Sprintf("sg-%d", srv.groupId.next()),
 		perms:       make(map[permKey]bool),
 	}
+	vpcId := req.Form.Get("VpcId")
+	if vpcId != "" {
+		g.vpcId = vpcId
+	}
 	srv.groups[g.id] = g
 	// we define a local type for this because ec2.CreateSecurityGroupResp
 	// contains SecurityGroup, but the response to this request
@@ -650,26 +810,36 @@ func (srv *Server) describeInstances(w http.ResponseWriter, req *http.Request, r
 
 	f := newFilter(req.Form)
 
-	var resp ec2.DescribeInstancesResp
+	var resp ec2.InstancesResp
 	resp.RequestId = reqId
 	for _, r := range srv.reservations {
 		var instances []ec2.Instance
+		var groups []ec2.SecurityGroup
+		for _, g := range r.groups {
+			groups = append(groups, g.ec2SecurityGroup())
+		}
 		for _, inst := range r.instances {
 			if len(insts) > 0 && !insts[inst] {
 				continue
 			}
+			// make instances in state "shutting-down" to transition
+			// to "terminated" first, so we can simulate: shutdown,
+			// subsequent refresh of the state with Instances(),
+			// terminated.
+			if inst.state == ShuttingDown {
+				inst.state = Terminated
+			}
+
 			ok, err := f.ok(inst)
 			if ok {
-				instances = append(instances, inst.ec2instance())
+				instance := inst.ec2instance()
+				instance.SecurityGroups = groups
+				instances = append(instances, instance)
 			} else if err != nil {
 				fatalf(400, "InvalidParameterValue", "describe instances: %v", err)
 			}
 		}
 		if len(instances) > 0 {
-			var groups []ec2.SecurityGroup
-			for _, g := range r.groups {
-				groups = append(groups, g.ec2SecurityGroup())
-			}
 			resp.Reservations = append(resp.Reservations, ec2.Reservation{
 				ReservationId:  r.id,
 				OwnerId:        ownerId,
@@ -777,9 +947,11 @@ func (srv *Server) revokeSecurityGroupIngress(w http.ResponseWriter, req *http.R
 	}
 }
 
-var secGroupPat = regexp.MustCompile(`^sg-[a-z0-9]+$`)
-var ipPat = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$`)
-var ownerIdPat = regexp.MustCompile(`^[0-9]+$`)
+var (
+	secGroupPat = regexp.MustCompile(`^sg-[a-z0-9]+$`)
+	cidrIpPat   = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/([0-9]+)$`)
+	ownerIdPat  = regexp.MustCompile(`^[0-9]+$`)
+)
 
 // parsePerms returns a slice of permKey values extracted
 // from the permission fields in req.
@@ -863,7 +1035,7 @@ func (srv *Server) parsePerms(req *http.Request) []permKey {
 			}
 			switch rest {
 			case "CidrIp":
-				if !ipPat.MatchString(val) {
+				if !cidrIpPat.MatchString(val) {
 					fatalf(400, "InvalidPermission.Malformed", "Invalid IP range: %q", val)
 				}
 				ec2p.SourceIPs = append(ec2p.SourceIPs, val)
@@ -957,6 +1129,277 @@ func (srv *Server) deleteSecurityGroup(w http.ResponseWriter, req *http.Request,
 	}
 }
 
+func (srv *Server) createVpc(w http.ResponseWriter, req *http.Request, reqId string) interface{} {
+	cidrBlock := parseCidr(req.Form.Get("CidrBlock"))
+	tenancy := req.Form.Get("InstanceTenancy")
+	if tenancy == "" {
+		tenancy = "default"
+	}
+
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	v := &vpc{ec2.VPC{
+		Id:              fmt.Sprintf("vpc-%d", srv.vpcId.next()),
+		State:           "available",
+		CIDRBlock:       cidrBlock,
+		DHCPOptionsId:   fmt.Sprintf("dopt-%d", srv.dhcpOptsId.next()),
+		InstanceTenancy: tenancy,
+	}}
+	srv.vpcs[v.Id] = v
+	r := &ec2.CreateVPCResp{
+		RequestId: reqId,
+		VPC:       v.VPC,
+	}
+	return r
+}
+
+func (srv *Server) deleteVpc(w http.ResponseWriter, req *http.Request, reqId string) interface{} {
+	v := srv.vpc(req.Form.Get("VpcId"))
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+
+	delete(srv.vpcs, v.Id)
+	return &ec2.SimpleResp{
+		XMLName:   xml.Name{"", "DeleteVpcResponse"},
+		RequestId: reqId,
+	}
+}
+
+func (srv *Server) describeVpcs(w http.ResponseWriter, req *http.Request, reqId string) interface{} {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+
+	idMap := collectIds(req.Form, "VpcId.")
+	f := newFilter(req.Form)
+	var resp ec2.VPCsResp
+	resp.RequestId = reqId
+	for _, v := range srv.vpcs {
+		ok, err := f.ok(v)
+		if ok && (len(idMap) == 0 || idMap[v.Id]) {
+			resp.VPCs = append(resp.VPCs, v.VPC)
+		} else if err != nil {
+			fatalf(400, "InvalidParameterValue", "describe VPCs: %v", err)
+		}
+	}
+	return &resp
+}
+
+func (srv *Server) createSubnet(w http.ResponseWriter, req *http.Request, reqId string) interface{} {
+	v := srv.vpc(req.Form.Get("VpcId"))
+	cidrBlock := parseCidr(req.Form.Get("CidrBlock"))
+	availZone := req.Form.Get("AvailabilityZone")
+	if availZone == "" {
+		// Assign one automatically as AWS does.
+		availZone = "us-east-1b"
+	}
+	// calculate the available IP addresses, removing the first 4 and
+	// the last, which are reserved by AWS. Since we already checked
+	// the CIDR is valid, we don't check the error here.
+	_, ipnet, _ := net.ParseCIDR(cidrBlock)
+	maskOnes, maskBits := ipnet.Mask.Size()
+	availIPs := 1<<uint(maskBits-maskOnes) - 5
+
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	s := &subnet{ec2.Subnet{
+		Id:               fmt.Sprintf("subnet-%d", srv.subnetId.next()),
+		VPCId:            v.Id,
+		State:            "available",
+		CIDRBlock:        cidrBlock,
+		AvailZone:        availZone,
+		AvailableIPCount: availIPs,
+	}}
+	srv.subnets[s.Id] = s
+	r := &ec2.CreateSubnetResp{
+		RequestId: reqId,
+		Subnet:    s.Subnet,
+	}
+	return r
+}
+
+func (srv *Server) deleteSubnet(w http.ResponseWriter, req *http.Request, reqId string) interface{} {
+	s := srv.subnet(req.Form.Get("SubnetId"))
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+
+	delete(srv.subnets, s.Id)
+	return &ec2.SimpleResp{
+		XMLName:   xml.Name{"", "DeleteSubnetResponse"},
+		RequestId: reqId,
+	}
+}
+
+func (srv *Server) describeSubnets(w http.ResponseWriter, req *http.Request, reqId string) interface{} {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+
+	idMap := collectIds(req.Form, "SubnetId.")
+	f := newFilter(req.Form)
+	var resp ec2.SubnetsResp
+	resp.RequestId = reqId
+	for _, s := range srv.subnets {
+		ok, err := f.ok(s)
+		if ok && (len(idMap) == 0 || idMap[s.Id]) {
+			resp.Subnets = append(resp.Subnets, s.Subnet)
+		} else if err != nil {
+			fatalf(400, "InvalidParameterValue", "describe subnets: %v", err)
+		}
+	}
+	return &resp
+}
+
+func (srv *Server) createIFace(w http.ResponseWriter, req *http.Request, reqId string) interface{} {
+	s := srv.subnet(req.Form.Get("SubnetId"))
+	ipMap := make(map[int]ec2.PrivateIP)
+	primaryIP := req.Form.Get("PrivateIpAddress")
+	if primaryIP != "" {
+		ipMap[0] = ec2.PrivateIP{Address: primaryIP, IsPrimary: true}
+	}
+	desc := req.Form.Get("Description")
+
+	var groups []ec2.SecurityGroup
+	for name, vals := range req.Form {
+		if strings.HasPrefix(name, "SecurityGroupId.") {
+			g := ec2.SecurityGroup{Id: vals[0]}
+			sg := srv.group(g)
+			if sg == nil {
+				fatalf(400, "InvalidGroup.NotFound", "no such group %v", g)
+			}
+			groups = append(groups, sg.ec2SecurityGroup())
+		}
+		if strings.HasPrefix(name, "PrivateIpAddresses.") {
+			var ip ec2.PrivateIP
+			parts := strings.Split(name, ".")
+			index := atoi(parts[1]) - 1
+			if index < 0 {
+				fatalf(400, "InvalidParameterValue", "invalid index %s", name)
+			}
+			if _, ok := ipMap[index]; ok {
+				ip = ipMap[index]
+			}
+			switch parts[2] {
+			case "PrivateIpAddress":
+				ip.Address = vals[0]
+			case "Primary":
+				val, err := strconv.ParseBool(vals[0])
+				if err != nil {
+					fatalf(400, "InvalidParameterValue", "bad flag %s: %s", name, vals[0])
+				}
+				ip.IsPrimary = val
+			}
+			ipMap[index] = ip
+		}
+	}
+	privateIPs := make([]ec2.PrivateIP, len(ipMap))
+	for index, ip := range ipMap {
+		if ip.IsPrimary {
+			primaryIP = ip.Address
+		}
+		privateIPs[index] = ip
+	}
+
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	i := &iface{ec2.NetworkInterface{
+		Id:               fmt.Sprintf("eni-%d", srv.ifaceId.next()),
+		SubnetId:         s.Id,
+		VPCId:            s.VPCId,
+		AvailZone:        s.AvailZone,
+		Description:      desc,
+		OwnerId:          ownerId,
+		Status:           "available",
+		MACAddress:       fmt.Sprintf("%02d:81:60:cb:27:37", srv.ifaceId),
+		PrivateIPAddress: primaryIP,
+		SourceDestCheck:  true,
+		Groups:           groups,
+		PrivateIPs:       privateIPs,
+	}}
+	srv.ifaces[i.Id] = i
+	r := &ec2.CreateNetworkInterfaceResp{
+		RequestId:        reqId,
+		NetworkInterface: i.NetworkInterface,
+	}
+	return r
+}
+
+func (srv *Server) deleteIFace(w http.ResponseWriter, req *http.Request, reqId string) interface{} {
+	i := srv.iface(req.Form.Get("NetworkInterfaceId"))
+
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+
+	delete(srv.ifaces, i.Id)
+	return &ec2.SimpleResp{
+		XMLName:   xml.Name{"", "DeleteNetworkInterface"},
+		RequestId: reqId,
+	}
+}
+
+func (srv *Server) describeIFaces(w http.ResponseWriter, req *http.Request, reqId string) interface{} {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+
+	idMap := collectIds(req.Form, "NetworkInterfaceId.")
+	f := newFilter(req.Form)
+	var resp ec2.NetworkInterfacesResp
+	resp.RequestId = reqId
+	for _, i := range srv.ifaces {
+		ok, err := f.ok(i)
+		if ok && (len(idMap) == 0 || idMap[i.Id]) {
+			resp.Interfaces = append(resp.Interfaces, i.NetworkInterface)
+		} else if err != nil {
+			fatalf(400, "InvalidParameterValue", "describe ifaces: %v", err)
+		}
+	}
+	return &resp
+}
+
+func (srv *Server) attachIFace(w http.ResponseWriter, req *http.Request, reqId string) interface{} {
+	i := srv.iface(req.Form.Get("NetworkInterfaceId"))
+	inst := srv.instance(req.Form.Get("InstanceId"))
+	devIndex := atoi(req.Form.Get("DeviceIndex"))
+
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	a := &attachment{ec2.NetworkInterfaceAttachment{
+		Id:                  fmt.Sprintf("eni-attach-%d", srv.attachId.next()),
+		InstanceId:          inst.id(),
+		InstanceOwnerId:     ownerId,
+		DeviceIndex:         devIndex,
+		Status:              "in-use",
+		AttachTime:          time.Now().Format(time.RFC3339),
+		DeleteOnTermination: true,
+	}}
+	srv.attachments[a.Id] = a
+	i.Attachment = a.NetworkInterfaceAttachment
+	srv.ifaces[i.Id] = i
+	r := &ec2.AttachNetworkInterfaceResp{
+		RequestId:    reqId,
+		AttachmentId: a.Id,
+	}
+	return r
+}
+
+func (srv *Server) detachIFace(w http.ResponseWriter, req *http.Request, reqId string) interface{} {
+	att := srv.attachment(req.Form.Get("AttachmentId"))
+
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+
+	for _, i := range srv.ifaces {
+		if i.Attachment.Id == att.Id {
+			i.Attachment = ec2.NetworkInterfaceAttachment{}
+			srv.ifaces[i.Id] = i
+			break
+		}
+	}
+	delete(srv.attachments, att.Id)
+	return &ec2.SimpleResp{
+		XMLName:   xml.Name{"", "DetachNetworkInterface"},
+		RequestId: reqId,
+	}
+}
+
 func (r *reservation) hasRunningMachine() bool {
 	for _, inst := range r.instances {
 		if inst.state.Code != ShuttingDown.Code && inst.state.Code != Terminated.Code {
@@ -964,6 +1407,97 @@ func (r *reservation) hasRunningMachine() bool {
 		}
 	}
 	return false
+}
+
+func parseCidr(val string) string {
+	if val == "" {
+		fatalf(400, "MissingParameter", "missing cidrBlock")
+	}
+	if _, _, err := net.ParseCIDR(val); err != nil {
+		fatalf(400, "InvalidParameterValue", "bad CIDR %q: %v", val, err)
+	}
+	return val
+}
+
+func (srv *Server) vpc(id string) *vpc {
+	if id == "" {
+		fatalf(400, "MissingParameter", "missing vpcId")
+	}
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	v, found := srv.vpcs[id]
+	if !found {
+		fatalf(400, "InvalidVpcID.NotFound", "VPC %s not found", id)
+	}
+	return v
+}
+
+func (srv *Server) subnet(id string) *subnet {
+	if id == "" {
+		fatalf(400, "MissingParameter", "missing subnetId")
+	}
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	s, found := srv.subnets[id]
+	if !found {
+		fatalf(400, "InvalidSubnetID.NotFound", "subnet %s not found", id)
+	}
+	return s
+}
+
+func (srv *Server) iface(id string) *iface {
+	if id == "" {
+		fatalf(400, "MissingParameter", "missing networkInterfaceId")
+	}
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	i, found := srv.ifaces[id]
+	if !found {
+		fatalf(400, "InvalidNetworkInterfaceID.NotFound", "interface %s not found", id)
+	}
+	return i
+}
+
+func (srv *Server) instance(id string) *Instance {
+	if id == "" {
+		fatalf(400, "MissingParameter", "missing instanceId")
+	}
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	inst, found := srv.instances[id]
+	if !found {
+		fatalf(400, "InvalidInstanceID.NotFound", "instance %s not found", id)
+	}
+	return inst
+}
+
+func (srv *Server) attachment(id string) *attachment {
+	if id == "" {
+		fatalf(400, "MissingParameter", "missing attachmentId")
+	}
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	att, found := srv.attachments[id]
+	if !found {
+		fatalf(
+			400,
+			"InvalidNetworkInterfaceAttachmentId.NotFound",
+			"attachment %s not found", id,
+		)
+	}
+	return att
+}
+
+// collectIds takes all values with the given prefix from form and
+// returns a map with the ids as keys.
+func collectIds(form url.Values, prefix string) map[string]bool {
+	idMap := make(map[string]bool)
+	for name, vals := range form {
+		if strings.HasPrefix(name, prefix) {
+			idMap[vals[0]] = true
+		}
+	}
+	return idMap
 }
 
 type counter int

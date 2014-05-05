@@ -1,7 +1,7 @@
 package ec2
 
 import (
-	"github.com/paddie/goamz/aws"
+	"launchpad.net/goamz/aws"
 	"time"
 )
 
@@ -20,3 +20,5 @@ func FakeTime(fakeIt bool) {
 		timeNow = time.Now
 	}
 }
+
+var PrepareRunParams = prepareRunParams

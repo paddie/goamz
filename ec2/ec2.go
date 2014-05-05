@@ -5,8 +5,6 @@
 //
 // Copyright (c) 2011 Canonical Ltd.
 //
-// Written by Gustavo Niemeyer <gustavo.niemeyer@canonical.com>
-//
 
 package ec2
 
@@ -15,7 +13,7 @@ import (
 	"encoding/hex"
 	"encoding/xml"
 	"fmt"
-	"github.com/paddie/goamz/aws"
+	"launchpad.net/goamz/aws"
 	"log"
 	"net/http"
 	"net/http/httputil"
@@ -25,7 +23,16 @@ import (
 	"time"
 )
 
-const debug = false
+const (
+	debug = false
+
+	// legacyAPIVersion is the AWS API version used for all but
+	// VPC-related requests.
+	legacyAPIVersion = "2011-12-15"
+
+	// AWS API version used for VPC-related calls.
+	vpcAPIVersion = "2013-10-15"
+)
 
 // The EC2 type encapsulates operations with a specific EC2 region.
 type EC2 struct {
@@ -119,7 +126,6 @@ type xmlErrors struct {
 var timeNow = time.Now
 
 func (ec2 *EC2) query(params map[string]string, resp interface{}) error {
-	params["Version"] = "2014-02-01"
 	params["Timestamp"] = timeNow().In(time.UTC).Format(time.RFC3339)
 	endpoint, err := url.Parse(ec2.Region.EC2Endpoint)
 	if err != nil {
@@ -175,8 +181,17 @@ func buildError(r *http.Response) error {
 }
 
 func makeParams(action string) map[string]string {
+	return makeParamsWithVersion(action, legacyAPIVersion)
+}
+
+func makeParamsVPC(action string) map[string]string {
+	return makeParamsWithVersion(action, vpcAPIVersion)
+}
+
+func makeParamsWithVersion(action, version string) map[string]string {
 	params := make(map[string]string)
 	params["Action"] = action
+	params["Version"] = version
 	return params
 }
 
@@ -189,10 +204,41 @@ func addParamsList(params map[string]string, label string, ids []string) {
 // ----------------------------------------------------------------------------
 // Instance management functions and types.
 
+// RunNetworkInterface encapsulates options for a single network
+// interface, specified when calling RunInstances.
+//
+// If Id is set, it must match an existing VPC network interface, and
+// in this case only a single instance can be launched. If Id is not
+// set, a new network interface will be created for each instance.
+//
+// The following fields are required when creating a new network
+// interface (i.e. Id is empty): DeviceIndex, SubnetId, Description
+// (only used if set), SecurityGroupIds.
+//
+// PrivateIPs can be used to add one or more private IP addresses to a
+// network interface. Only one of the IP addresses can be set as
+// primary. If none are given, EC2 selects a primary IP for each
+// created interface from the subnet pool.
+//
+// When SecondaryPrivateIPCount is non-zero, EC2 allocates that number
+// of IP addresses from within the subnet range and sets them as
+// secondary IPs. The number of IP addresses that can be assigned to a
+// network interface varies by instance type.
+type RunNetworkInterface struct {
+	Id                      string
+	DeviceIndex             int
+	SubnetId                string
+	Description             string
+	PrivateIPs              []PrivateIP
+	SecurityGroupIds        []string
+	DeleteOnTermination     bool
+	SecondaryPrivateIPCount int
+}
+
 // The RunInstances type encapsulates options for the respective request in EC2.
 //
 // See http://goo.gl/Mcm3b for more details.
-type RunInstancesOptions struct {
+type RunInstances struct {
 	ImageId               string
 	MinCount              int
 	MaxCount              int
@@ -202,17 +248,15 @@ type RunInstancesOptions struct {
 	KernelId              string
 	RamdiskId             string
 	UserData              []byte
-	AvailabilityZone      string
+	AvailZone             string
 	PlacementGroupName    string
-	Tenancy               string
 	Monitoring            bool
 	SubnetId              string
 	DisableAPITermination bool
 	ShutdownBehavior      string
 	PrivateIPAddress      string
-	IamInstanceProfile    IamInstanceProfile
 	BlockDeviceMappings   []BlockDeviceMapping
-	EbsOptimized          bool
+	NetworkInterfaces     []RunNetworkInterface
 }
 
 // Response to a RunInstances request.
@@ -230,147 +274,37 @@ type RunInstancesResp struct {
 //
 // See http://goo.gl/OCH8a for more details.
 type Instance struct {
-
-	// General instance information
-	InstanceId         string              `xml:"instanceId"`                 // The ID of the instance launched
-	InstanceType       string              `xml:"instanceType"`               // The instance type eg. m1.small | m1.medium | m1.large etc
-	AvailabilityZone   string              `xml:"placement>availabilityZone"` // The Availability Zone the instance is located in
-	Tags               []Tag               `xml:"tagSet>item"`                // Any tags assigned to the resource
-	State              InstanceState       `xml:"instanceState"`              // The current state of the instance
-	Reason             string              `xml:"reason"`                     // The reason for the most recent state transition. This might be an empty string
-	StateReason        InstanceStateReason `xml:"stateReason"`                // The reason for the most recent state transition
-	ImageId            string              `xml:"imageId"`                    // The ID of the AMI used to launch the instance
-	KeyName            string              `xml:"keyName"`                    // The key pair name, if this instance was launched with an associated key pair
-	Monitoring         string              `xml:"monitoring>state"`           // Valid values: disabled | enabled | pending
-	IamInstanceProfile IamInstanceProfile  `xml:"iamInstanceProfile"`         // The IAM instance profile associated with the instance
-	LaunchTime         string              `xml:"launchTime"`                 // The time the instance was launched
-	OwnerId            string              // This isn't currently returned in the response, and is taken from the parent reservation
-
-	// More specific information
-	Architecture          string        `xml:"architecture"`          // Valid values: i386 | x86_64
-	Hypervisor            string        `xml:"hypervisor"`            // Valid values: ovm | xen
-	KernelId              string        `xml:"kernelId"`              // The kernel associated with this instance
-	RamDiskId             string        `xml:"ramdiskId"`             // The RAM disk associated with this instance
-	Platform              string        `xml:"platform"`              // The value is Windows for Windows AMIs; otherwise blank
-	VirtualizationType    string        `xml:"virtualizationType"`    // Valid values: paravirtual | hvm
-	AMILaunchIndex        int           `xml:"amiLaunchIndex"`        // The AMI launch index, which can be used to find this instance in the launch group
-	PlacementGroupName    string        `xml:"placement>groupName"`   // The name of the placement group the instance is in (for cluster compute instances)
-	Tenancy               string        `xml:"placement>tenancy"`     // (VPC only) Valid values: default | dedicated
-	InstanceLifecycle     string        `xml:"instanceLifecycle"`     // Spot instance? Valid values: "spot" or blank
-	SpotInstanceRequestId string        `xml:"spotInstanceRequestId"` // The ID of the Spot Instance request
-	ClientToken           string        `xml:"clientToken"`           // The idempotency token you provided when you launched the instance
-	ProductCodes          []ProductCode `xml:"productCodes>item"`     // The product codes attached to this instance
-
-	// Storage
-	RootDeviceType string        `xml:"rootDeviceType"`          // Valid values: ebs | instance-store
-	RootDeviceName string        `xml:"rootDeviceName"`          // The root device name (for example, /dev/sda1)
-	BlockDevices   []BlockDevice `xml:"blockDeviceMapping>item"` // Any block device mapping entries for the instance
-	EbsOptimized   bool          `xml:"ebsOptimized"`            // Indicates whether the instance is optimized for Amazon EBS I/O
-
-	// Network
-	DNSName          string          `xml:"dnsName"`          // The public DNS name assigned to the instance. This element remains empty until the instance enters the running state
-	PrivateDNSName   string          `xml:"privateDnsName"`   // The private DNS name assigned to the instance. This DNS name can only be used inside the Amazon EC2 network. This element remains empty until the instance enters the running state
-	IPAddress        string          `xml:"ipAddress"`        // The public IP address assigned to the instance
-	PrivateIPAddress string          `xml:"privateIpAddress"` // The private IP address assigned to the instance
-	SubnetId         string          `xml:"subnetId"`         // The ID of the subnet in which the instance is running
-	VpcId            string          `xml:"vpcId"`            // The ID of the VPC in which the instance is running
-	SecurityGroups   []SecurityGroup `xml:"groupSet>item"`    // A list of the security groups for the instance
-
-	// Advanced Networking
-	NetworkInterfaces []InstanceNetworkInterface `xml:"networkInterfaceSet>item"` // (VPC) One or more network interfaces for the instance
-	SourceDestCheck   bool                       `xml:"sourceDestCheck"`          // Controls whether source/destination checking is enabled on the instance
-	SriovNetSupport   string                     `xml:"sriovNetSupport"`          // Specifies whether enhanced networking is enabled. Valid values: simple
-}
-
-// isSpotInstance returns if the instance is a spot instance
-func (i Instance) IsSpotInstance() bool {
-	if i.InstanceLifecycle == "spot" {
-		return true
-	}
-	return false
-}
-
-type BlockDevice struct {
-	DeviceName string `xml:"deviceName"`
-	EBS        EBS    `xml:"ebs"`
-}
-
-type EBS struct {
-	VolumeId            string `xml:"volumeId"`
-	Status              string `xml:"status"`
-	AttachTime          string `xml:"attachTime"`
-	DeleteOnTermination bool   `xml:"deleteOnTermination"`
-}
-
-// ProductCode represents a product code
-// See http://goo.gl/hswmQm for more details.
-type ProductCode struct {
-	ProductCode string `xml:"productCode"` // The product code
-	Type        string `xml:"type"`        // Valid values: devpay | marketplace
-}
-
-// InstanceNetworkInterface represents a network interface attached to an instance
-// See http://goo.gl/9eW02N for more details.
-type InstanceNetworkInterface struct {
-	Id                 string                              `xml:"networkInterfaceId"`
-	Description        string                              `xml:"description"`
-	SubnetId           string                              `xml:"subnetId"`
-	VpcId              string                              `xml:"vpcId"`
-	OwnerId            string                              `xml:"ownerId"` // The ID of the AWS account that created the network interface.
-	Status             string                              `xml:"status"`  // Valid values: available | attaching | in-use | detaching
-	MacAddress         string                              `xml:"macAddress"`
-	PrivateIPAddress   string                              `xml:"privateIpAddress"`
-	PrivateDNSName     string                              `xml:"privateDnsName"`
-	SourceDestCheck    bool                                `xml:"sourceDestCheck"`
-	SecurityGroups     []SecurityGroup                     `xml:"groupSet>item"`
-	Attachment         InstanceNetworkInterfaceAttachment  `xml:"attachment"`
-	Association        InstanceNetworkInterfaceAssociation `xml:"association"`
-	PrivateIPAddresses []InstancePrivateIpAddress          `xml:"privateIpAddressesSet>item"`
-}
-
-// InstanceNetworkInterfaceAttachment describes a network interface attachment to an instance
-// See http://goo.gl/0ql0Cg for more details
-type InstanceNetworkInterfaceAttachment struct {
-	AttachmentID        string `xml:"attachmentID"`        // The ID of the network interface attachment.
-	DeviceIndex         int32  `xml:"deviceIndex"`         // The index of the device on the instance for the network interface attachment.
-	Status              string `xml:"status"`              // Valid values: attaching | attached | detaching | detached
-	AttachTime          string `xml:"attachTime"`          // Time attached, as a Datetime
-	DeleteOnTermination bool   `xml:"deleteOnTermination"` // Indicates whether the network interface is deleted when the instance is terminated.
-}
-
-// Describes association information for an Elastic IP address.
-// See http://goo.gl/YCDdMe for more details
-type InstanceNetworkInterfaceAssociation struct {
-	PublicIP      string `xml:"publicIp"`      // The address of the Elastic IP address bound to the network interface
-	PublicDNSName string `xml:"publicDnsName"` // The public DNS name
-	IPOwnerId     string `xml:"ipOwnerId"`     // The ID of the owner of the Elastic IP address
-}
-
-// InstancePrivateIpAddress describes a private IP address
-// See http://goo.gl/irN646 for more details
-type InstancePrivateIpAddress struct {
-	PrivateIPAddress string                              `xml:"privateIpAddress"` // The private IP address of the network interface
-	PrivateDNSName   string                              `xml:"privateDnsName"`   // The private DNS name
-	Primary          bool                                `xml:"primary"`          // Indicates whether this IP address is the primary private IP address of the network interface
-	Association      InstanceNetworkInterfaceAssociation `xml:"association"`      // The association information for an Elastic IP address for the network interface
-}
-
-// IamInstanceProfile
-// See http://goo.gl/PjyijL for more details
-type IamInstanceProfile struct {
-	ARN  string `xml:"arn"`
-	Id   string `xml:"id"`
-	Name string `xml:"name"`
+	InstanceId         string             `xml:"instanceId"`
+	InstanceType       string             `xml:"instanceType"`
+	ImageId            string             `xml:"imageId"`
+	PrivateDNSName     string             `xml:"privateDnsName"`
+	DNSName            string             `xml:"dnsName"`
+	IPAddress          string             `xml:"ipAddress"`
+	PrivateIPAddress   string             `xml:"privateIpAddress"`
+	SubnetId           string             `xml:"subnetId"`
+	VPCId              string             `xml:"vpcId"`
+	SourceDestCheck    bool               `xml:"sourceDestCheck"`
+	KeyName            string             `xml:"keyName"`
+	AMILaunchIndex     int                `xml:"amiLaunchIndex"`
+	Hypervisor         string             `xml:"hypervisor"`
+	VirtType           string             `xml:"virtualizationType"`
+	Monitoring         string             `xml:"monitoring>state"`
+	AvailZone          string             `xml:"placement>availabilityZone"`
+	PlacementGroupName string             `xml:"placement>groupName"`
+	State              InstanceState      `xml:"instanceState"`
+	Tags               []Tag              `xml:"tagSet>item"`
+	SecurityGroups     []SecurityGroup    `xml:"groupSet>item"`
+	NetworkInterfaces  []NetworkInterface `xml:"networkInterfaceSet>item"`
 }
 
 // RunInstances starts new instances in EC2.
 // If options.MinCount and options.MaxCount are both zero, a single instance
 // will be started; otherwise if options.MaxCount is zero, options.MinCount
-// will be used insteead.
+// will be used instead.
 //
 // See http://goo.gl/Mcm3b for more details.
-func (ec2 *EC2) RunInstances(options *RunInstancesOptions) (resp *RunInstancesResp, err error) {
-	params := makeParams("RunInstances")
+func (ec2 *EC2) RunInstances(options *RunInstances) (resp *RunInstancesResp, err error) {
+	params := prepareRunParams(*options)
 	params["ImageId"] = options.ImageId
 	params["InstanceType"] = options.InstanceType
 	var min, max int
@@ -396,31 +330,8 @@ func (ec2 *EC2) RunInstances(options *RunInstancesOptions) (resp *RunInstancesRe
 			j++
 		}
 	}
-
-	for i, d := range options.BlockDeviceMappings {
-		if d.DeviceName != "" {
-			params["BlockDeviceMapping."+strconv.Itoa(i)+".DeviceName"] = d.DeviceName
-		}
-		if d.VirtualName != "" {
-			params["BlockDeviceMapping."+strconv.Itoa(i)+".VirtualName"] = d.VirtualName
-		}
-		if d.SnapshotId != "" {
-			params["BlockDeviceMapping."+strconv.Itoa(i)+".Ebs.SnapshotId"] = d.SnapshotId
-		}
-		if d.VolumeType != "" {
-			params["BlockDeviceMapping."+strconv.Itoa(i)+".Ebs.VolumeType"] = d.VolumeType
-		}
-		if d.VolumeSize != 0 {
-			params["BlockDeviceMapping."+strconv.Itoa(i)+".Ebs.VolumeSize"] = strconv.FormatInt(d.VolumeSize, 10)
-		}
-		if d.DeleteOnTermination {
-			params["BlockDeviceMapping."+strconv.Itoa(i)+".Ebs.DeleteOnTermination"] = "true"
-		}
-		if d.IOPS != 0 {
-			params["BlockDeviceMapping."+strconv.Itoa(i)+".Ebs.Iops"] = strconv.FormatInt(d.IOPS, 10)
-		}
-	}
-
+	prepareBlockDevices(params, options.BlockDeviceMappings)
+	prepareNetworkInterfaces(params, options.NetworkInterfaces)
 	token, err := clientToken()
 	if err != nil {
 		return nil, err
@@ -441,14 +352,11 @@ func (ec2 *EC2) RunInstances(options *RunInstancesOptions) (resp *RunInstancesRe
 		b64.Encode(userData, options.UserData)
 		params["UserData"] = string(userData)
 	}
-	if options.AvailabilityZone != "" {
-		params["Placement.AvailabilityZone"] = options.AvailabilityZone
+	if options.AvailZone != "" {
+		params["Placement.AvailabilityZone"] = options.AvailZone
 	}
 	if options.PlacementGroupName != "" {
 		params["Placement.GroupName"] = options.PlacementGroupName
-	}
-	if options.Tenancy != "" {
-		params["Placement.Tenancy"] = options.Tenancy
 	}
 	if options.Monitoring {
 		params["Monitoring.Enabled"] = "true"
@@ -465,15 +373,6 @@ func (ec2 *EC2) RunInstances(options *RunInstancesOptions) (resp *RunInstancesRe
 	if options.PrivateIPAddress != "" {
 		params["PrivateIpAddress"] = options.PrivateIPAddress
 	}
-	if options.IamInstanceProfile.ARN != "" {
-		params["IamInstanceProfile.Arn"] = options.IamInstanceProfile.ARN
-	}
-	if options.IamInstanceProfile.Name != "" {
-		params["IamInstanceProfile.Name"] = options.IamInstanceProfile.Name
-	}
-	if options.EbsOptimized {
-		params["EbsOptimized"] = "true"
-	}
 
 	resp = &RunInstancesResp{}
 	err = ec2.query(params, resp)
@@ -481,6 +380,81 @@ func (ec2 *EC2) RunInstances(options *RunInstancesOptions) (resp *RunInstancesRe
 		return nil, err
 	}
 	return
+}
+
+func prepareRunParams(options RunInstances) map[string]string {
+	if options.SubnetId != "" || len(options.NetworkInterfaces) > 0 {
+		// When either SubnetId or NetworkInterfaces are specified, we
+		// need to use the API version with complete VPC support.
+		return makeParamsVPC("RunInstances")
+	} else {
+		return makeParams("RunInstances")
+	}
+}
+
+func prepareBlockDevices(params map[string]string, blockDevs []BlockDeviceMapping) {
+	for i, b := range blockDevs {
+		n := strconv.Itoa(i + 1)
+		prefix := "BlockDeviceMapping." + n
+		if b.DeviceName != "" {
+			params[prefix+".DeviceName"] = b.DeviceName
+		}
+		if b.VirtualName != "" {
+			params[prefix+".VirtualName"] = b.VirtualName
+		}
+		if b.SnapshotId != "" {
+			params[prefix+".Ebs.SnapshotId"] = b.SnapshotId
+		}
+		if b.VolumeType != "" {
+			params[prefix+".Ebs.VolumeType"] = b.VolumeType
+		}
+		if b.VolumeSize > 0 {
+			params[prefix+".Ebs.VolumeSize"] = strconv.FormatInt(b.VolumeSize, 10)
+		}
+		if b.IOPS > 0 {
+			params[prefix+".Ebs.Iops"] = strconv.FormatInt(b.IOPS, 10)
+		}
+		if b.DeleteOnTermination {
+			params[prefix+".Ebs.DeleteOnTermination"] = "true"
+		}
+	}
+}
+
+func prepareNetworkInterfaces(params map[string]string, nics []RunNetworkInterface) {
+	for i, ni := range nics {
+		// Unlike other lists, NetworkInterface and PrivateIpAddresses
+		// should start from 0, not 1, according to the examples
+		// requests in the API documentation here http://goo.gl/Mcm3b.
+		n := strconv.Itoa(i)
+		prefix := "NetworkInterface." + n
+		if ni.Id != "" {
+			params[prefix+".NetworkInterfaceId"] = ni.Id
+		}
+		params[prefix+".DeviceIndex"] = strconv.Itoa(ni.DeviceIndex)
+		if ni.SubnetId != "" {
+			params[prefix+".SubnetId"] = ni.SubnetId
+		}
+		if ni.Description != "" {
+			params[prefix+".Description"] = ni.Description
+		}
+		for j, gid := range ni.SecurityGroupIds {
+			k := strconv.Itoa(j + 1)
+			params[prefix+".SecurityGroupId."+k] = gid
+		}
+		if ni.DeleteOnTermination {
+			params[prefix+".DeleteOnTermination"] = "true"
+		}
+		if ni.SecondaryPrivateIPCount > 0 {
+			val := strconv.Itoa(ni.SecondaryPrivateIPCount)
+			params[prefix+".SecondaryPrivateIpAddressCount"] = val
+		}
+		for j, ip := range ni.PrivateIPs {
+			k := strconv.Itoa(j)
+			subprefix := prefix + ".PrivateIpAddresses." + k
+			params[subprefix+".PrivateIpAddress"] = ip.Address
+			params[subprefix+".Primary"] = strconv.FormatBool(ip.IsPrimary)
+		}
+	}
 }
 
 func clientToken() (string, error) {
@@ -518,14 +492,6 @@ type InstanceStateChange struct {
 	PreviousState InstanceState `xml:"previousState"`
 }
 
-// InstanceStateReason describes a state change for an instance in EC2
-//
-// See http://goo.gl/KZkbXi for more details
-type InstanceStateReason struct {
-	Code    string `xml:"code"`
-	Message string `xml:"message"`
-}
-
 // TerminateInstances requests the termination of instances when the given ids.
 //
 // See http://goo.gl/3BKHj for more details.
@@ -540,188 +506,10 @@ func (ec2 *EC2) TerminateInstances(instIds []string) (resp *TerminateInstancesRe
 	return
 }
 
-// Response to a DescribeAddresses request.
-//
-// See http://goo.gl/zW7J4p for more details.
-type DescribeAddressesResp struct {
-	RequestId string    `xml:"requestId"`
-	Addresses []Address `xml:"addressesSet>item"`
-}
-
-// Address represents an Elastic IP Address
-// See http://goo.gl/uxCjp7 for more details
-type Address struct {
-	PublicIp                string `xml:"publicIp"`
-	AllocationId            string `xml:"allocationId"`
-	Domain                  string `xml:"domain"`
-	InstanceId              string `xml:"instanceId"`
-	AssociationId           string `xml:"associationId"`
-	NetworkInterfaceId      string `xml:"networkInterfaceId"`
-	NetworkInterfaceOwnerId string `xml:"networkInterfaceOwnerId"`
-	PrivateIpAddress        string `xml:"privateIpAddress"`
-}
-
-// DescribeAddresses returns details about one or more
-// Elastic IP Addresses. Returned addresses can be
-// filtered by Public IP, Allocation ID or multiple filters
-//
-// See http://goo.gl/zW7J4p for more details.
-func (ec2 *EC2) DescribeAddresses(publicIps []string, allocationIds []string, filter *Filter) (resp *DescribeAddressesResp, err error) {
-	params := makeParams("DescribeAddresses")
-	addParamsList(params, "PublicIp", publicIps)
-	addParamsList(params, "AllocationId", allocationIds)
-	filter.addParams(params)
-	resp = &DescribeAddressesResp{}
-	err = ec2.query(params, resp)
-	if err != nil {
-		return nil, err
-	}
-	return
-}
-
-//Response to an AllocateAddress request
-//
-// See  http://goo.gl/aLPmbm for more details
-type AllocateAddressResp struct {
-	RequestId    string `xml:"requestId"`
-	PublicIp     string `xml:"publicIp"`
-	Domain       string `xml:"domain"`
-	AllocationId string `xml:"allocationId"`
-}
-
-// Allocates a new Elastic ip address.
-// The domain parameter is optional and is used for provisioning an ip address
-// in EC2 or in VPC respectively
-//
-// See http://goo.gl/aLPmbm for more details
-func (ec2 *EC2) AllocateAddress(domain string) (resp *AllocateAddressResp, err error) {
-	params := makeParams("AllocateAddress")
-	params["Domain"] = domain
-
-	resp = &AllocateAddressResp{}
-	err = ec2.query(params, resp)
-	if err != nil {
-		return nil, err
-	}
-	return resp, nil
-}
-
-// Response to a ReleaseAddress request
-//
-// See http://goo.gl/Ciw2Z8 for more details
-type ReleaseAddressResp struct {
-	RequestId string `xml:"requestId"`
-	Return    bool   `xml:"return"`
-}
-
-// Release existing elastic ip address from the account
-// PublicIp = Required for EC2
-// AllocationId = Required for VPC
-//
-// See http://goo.gl/Ciw2Z8 for more details
-func (ec2 *EC2) ReleaseAddress(publicIp, allocationId string) (resp *ReleaseAddressResp, err error) {
-	params := makeParams("ReleaseAddress")
-
-	if publicIp != "" {
-		params["PublicIp"] = publicIp
-
-	}
-	if allocationId != "" {
-		params["AllocationId"] = allocationId
-	}
-
-	resp = &ReleaseAddressResp{}
-	err = ec2.query(params, resp)
-	if err != nil {
-		return nil, err
-	}
-	return resp, nil
-}
-
-// Options set for AssociateAddress
-//
-// See http://goo.gl/hhj4z7 for more details
-type AssociateAddressOptions struct {
-	PublicIp           string
-	InstanceId         string
-	AllocationId       string
-	NetworkInterfaceId string
-	PrivateIpAddress   string
-	AllowReassociation bool
-}
-
-// Response to an AssociateAddress request
-//
-// See http://goo.gl/hhj4z7 for more details
-type AssociateAddressResp struct {
-	RequestId     string `xml:"requestId"`
-	Return        bool   `xml:"return"`
-	AssociationId string `xml:"associationId"`
-}
-
-// Associate an Elastic ip address to an instance id or a network interface
-//
-// See http://goo.gl/hhj4z7 for more details
-func (ec2 *EC2) AssociateAddress(options *AssociateAddressOptions) (resp *AssociateAddressResp, err error) {
-	params := makeParams("AssociateAddress")
-	params["InstanceId"] = options.InstanceId
-	if options.PublicIp != "" {
-		params["PublicIp"] = options.PublicIp
-	}
-	if options.AllocationId != "" {
-		params["AllocationId"] = options.AllocationId
-	}
-	if options.NetworkInterfaceId != "" {
-		params["NetworkInterfaceId"] = options.NetworkInterfaceId
-	}
-	if options.PrivateIpAddress != "" {
-		params["PrivateIpAddress"] = options.PrivateIpAddress
-	}
-	if options.AllowReassociation {
-		params["AllowReassociation"] = "true"
-	}
-
-	resp = &AssociateAddressResp{}
-	err = ec2.query(params, resp)
-	if err != nil {
-		return nil, err
-	}
-	return resp, nil
-}
-
-// Response to a Diassociate request
-//
-// See http://goo.gl/Dapkuzfor more details
-type DiassociateAddressResp struct {
-	RequestId string `xml:"requestId"`
-	Return    bool   `xml:"return"`
-}
-
-// Diassociate an elastic ip address from an instance
-// PublicIp - Required for EC2
-// AssociationId - Required for VPC
-// See http://goo.gl/Dapkuz for more details
-func (ec2 *EC2) DiassociateAddress(publicIp, associationId string) (resp *DiassociateAddressResp, err error) {
-	params := makeParams("DiassociateAddress")
-	if publicIp != "" {
-		params["PublicIp"] = publicIp
-	}
-	if associationId != "" {
-		params["AssociationId"] = associationId
-	}
-
-	resp = &DiassociateAddressResp{}
-	err = ec2.query(params, resp)
-	if err != nil {
-		return nil, err
-	}
-	return resp, nil
-}
-
 // Response to a DescribeInstances request.
 //
 // See http://goo.gl/mLbmw for more details.
-type DescribeInstancesResp struct {
+type InstancesResp struct {
 	RequestId    string        `xml:"requestId"`
 	Reservations []Reservation `xml:"reservationSet>item"`
 }
@@ -742,25 +530,15 @@ type Reservation struct {
 // matching the given instance ids or filtering rules.
 //
 // See http://goo.gl/4No7c for more details.
-func (ec2 *EC2) DescribeInstances(instIds []string, filter *Filter) (resp *DescribeInstancesResp, err error) {
+func (ec2 *EC2) Instances(instIds []string, filter *Filter) (resp *InstancesResp, err error) {
 	params := makeParams("DescribeInstances")
 	addParamsList(params, "InstanceId", instIds)
 	filter.addParams(params)
-	resp = &DescribeInstancesResp{}
+	resp = &InstancesResp{}
 	err = ec2.query(params, resp)
 	if err != nil {
 		return nil, err
 	}
-
-	// Add additional parameters to instances which aren't available in the response
-	for i, rsv := range resp.Reservations {
-		ownerId := rsv.OwnerId
-		for j, inst := range rsv.Instances {
-			inst.OwnerId = ownerId
-			resp.Reservations[i].Instances[j] = inst
-		}
-	}
-
 	return
 }
 
@@ -783,7 +561,7 @@ type BlockDeviceMapping struct {
 	VirtualName         string `xml:"virtualName"`
 	SnapshotId          string `xml:"ebs>snapshotId"`
 	VolumeType          string `xml:"ebs>volumeType"`
-	VolumeSize          int64  `xml:"ebs>volumeSize"`
+	VolumeSize          int64  `xml:"ebs>volumeSize"` // Size is given in GB
 	DeleteOnTermination bool   `xml:"ebs>deleteOnTermination"`
 
 	// The number of I/O operations per second (IOPS) that the volume supports.
@@ -812,7 +590,6 @@ type Image struct {
 	RootDeviceType     string               `xml:"rootDeviceType"`
 	RootDeviceName     string               `xml:"rootDeviceName"`
 	VirtualizationType string               `xml:"virtualizationType"`
-	Tags               []Tag                `xml:"tagSet>item"`
 	Hypervisor         string               `xml:"hypervisor"`
 	BlockDevices       []BlockDeviceMapping `xml:"blockDeviceMapping>item"`
 }
@@ -886,7 +663,6 @@ func (ec2 *EC2) DeleteSnapshots(ids []string) (resp *SimpleResp, err error) {
 	if err != nil {
 		return nil, err
 	}
-
 	return
 }
 
@@ -949,14 +725,26 @@ type CreateSecurityGroupResp struct {
 	RequestId string `xml:"requestId"`
 }
 
-// CreateSecurityGroup run a CreateSecurityGroup request in EC2, with the provided
-// name and description.
+// CreateSecurityGroup creates a security group with the provided name
+// and description.
 //
 // See http://goo.gl/Eo7Yl for more details.
 func (ec2 *EC2) CreateSecurityGroup(name, description string) (resp *CreateSecurityGroupResp, err error) {
-	params := makeParams("CreateSecurityGroup")
+	return ec2.CreateSecurityGroupVPC("", name, description)
+}
+
+// CreateSecurityGroupVPC creates a security group in EC2, associated
+// with the given VPC ID. If vpcId is empty, this call is equivalent
+// to CreateSecurityGroup.
+//
+// See http://goo.gl/Eo7Yl for more details.
+func (ec2 *EC2) CreateSecurityGroupVPC(vpcId, name, description string) (resp *CreateSecurityGroupResp, err error) {
+	params := makeParamsVPC("CreateSecurityGroup")
 	params["GroupName"] = name
 	params["GroupDescription"] = description
+	if vpcId != "" {
+		params["VpcId"] = vpcId
+	}
 
 	resp = &CreateSecurityGroupResp{}
 	err = ec2.query(params, resp)
@@ -981,6 +769,7 @@ type SecurityGroupsResp struct {
 // See http://goo.gl/CIdyP for more details.
 type SecurityGroupInfo struct {
 	SecurityGroup
+	VPCId       string   `xml:"vpcId"`
 	OwnerId     string   `xml:"ownerId"`
 	Description string   `xml:"groupDescription"`
 	IPPerms     []IPPerm `xml:"ipPermissions>item"`
@@ -1131,7 +920,7 @@ func (ec2 *EC2) authOrRevoke(op string, group SecurityGroup, perms []IPPerm) (re
 	return resp, nil
 }
 
-// ResourceTag represents key-value metadata used to classify and organize
+// Tag represents key-value metadata used to classify and organize
 // EC2 instances.
 //
 // See http://goo.gl/bncl3 for more details

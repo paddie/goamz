@@ -70,19 +70,6 @@ type SpotPriceRequest struct {
 	// 2010-08-16T05:06:11.000Z
 	StartTime time.Time `xml:"StartTime"`
 	EndTime   time.Time `xml:"EndTime"`
-	// General purpose
-	// - m1.small | m1.medium | m1.large | m1.xlarge | m3.medium | m3.large | m3.xlarge | m3.2xlarge
-	// Compute optimized
-	// - c1.medium | c1.xlarge | c3.large | c3.xlarge | c3.2xlarge | c3.4xlarge | c3.8xlarge | cc2.8xlarge
-	// Memory optimized
-	// - m2.xlarge | m2.2xlarge | m2.4xlarge | cr1.8xlarge
-	// Storage optimized
-	// - hi1.4xlarge | hs1.8xlarge | i2.xlarge | i2.2xlarge | i2.4xlarge | i2.8xlarge
-	// Micro instances
-	// - t1.micro
-	// GPU instances
-	// - cg1.4xlarge | g2.2xlarge
-
 	// t1.micro | m1.small | m1.medium |
 	// m1.large | m1.xlarge | m3.xlarge |
 	// m3.2xlarge | c1.medium | c1.xlarge |
